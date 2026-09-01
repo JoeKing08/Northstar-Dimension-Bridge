@@ -1,21 +1,20 @@
 package com.joeking.northstarbridge;
 
 import net.minecraft.core.registries.Registries;
-import net.minecraft.core.Registry;
-import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.Level;
-import net.minecraft.world.level.dimension.LevelStem;
 import net.minecraft.world.level.storage.LevelResource;
-import com.lightning.northstar.accessor.NorthstarLevel;
 import com.lightning.northstar.content.NorthstarRegistries;
 import com.lightning.northstar.planet.data.PlanetDimension;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.event.TagsUpdatedEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.level.LevelEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
+import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,7 +33,6 @@ import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 
 @EventBusSubscriber(modid = NorthstarBridge.MOD_ID)
 public final class DimensionBridgeScanner {
@@ -46,15 +44,9 @@ public final class DimensionBridgeScanner {
 
     private static MinecraftServer server;
     private static Set<ResourceLocation> lastEligible = Set.of();
-    private static Set<ResourceLocation> pendingVerification = Set.of();
-    private static boolean reloadPending;
     private static boolean scanRequested;
-    private static boolean forceReloadRequested;
-    private static boolean notifyWhenReady;
-    private static boolean retryInProgress;
+    private static boolean forceScanRequested;
     private static int tickCounter;
-    private static int verificationDelayTicks;
-    private static int verificationAttempts;
 
     private DimensionBridgeScanner() {
     }
@@ -63,6 +55,17 @@ public final class DimensionBridgeScanner {
     public static void onServerStarted(ServerStartedEvent event) {
         server = event.getServer();
         scan(true, false);
+    }
+
+    @SubscribeEvent
+    public static void onServerStopped(ServerStoppedEvent event) {
+        if (event.getServer() == server) {
+            server = null;
+            lastEligible = Set.of();
+            scanRequested = false;
+            forceScanRequested = false;
+            tickCounter = 0;
+        }
     }
 
     @SubscribeEvent
@@ -79,26 +82,11 @@ public final class DimensionBridgeScanner {
             return;
         }
 
-        if (verificationDelayTicks > 0) {
-            verificationDelayTicks--;
-            if (verificationDelayTicks == 0) {
-                verifyMappings();
-            }
-        }
-
-        if (reloadPending) {
-            return;
-        }
-
-        if (forceReloadRequested) {
-            forceReloadRequested = false;
-            scan(true, true);
-            return;
-        }
-
         if (scanRequested) {
             scanRequested = false;
-            scan(false, true);
+            boolean force = forceScanRequested;
+            forceScanRequested = false;
+            scan(force, true);
             return;
         }
 
@@ -109,7 +97,24 @@ public final class DimensionBridgeScanner {
         }
     }
 
-    private static void scan(boolean force, boolean notifyPlayers) {
+    @SubscribeEvent
+    public static void onTagsUpdated(TagsUpdatedEvent event) {
+        if (event.getUpdateCause() == TagsUpdatedEvent.UpdateCause.SERVER_DATA_LOAD && server != null) {
+            // Northstar rebuilt its tracker from the frozen data registries. Restore any
+            // bridge-only runtime entries on the next completed server tick.
+            scanRequested = true;
+            forceScanRequested = true;
+        }
+    }
+
+    @SubscribeEvent
+    public static void onPlayerLogin(PlayerEvent.PlayerLoggedInEvent event) {
+        if (server != null && event.getEntity() instanceof ServerPlayer player && !lastEligible.isEmpty()) {
+            BridgeNetworking.sendSnapshot(player, lastEligible);
+        }
+    }
+
+    private static void scan(boolean force, boolean syncPlayers) {
         Set<ResourceLocation> eligible = collectEligibleDimensions(server);
         if (!force && eligible.equals(lastEligible)) {
             return;
@@ -117,11 +122,20 @@ public final class DimensionBridgeScanner {
 
         try {
             writeGeneratedPack(server, eligible);
+        } catch (IOException exception) {
+            LOGGER.error("Failed to persist generated Northstar dimension data", exception);
+        }
+
+        try {
+            int installed = RuntimePlanetBridge.installServer(eligible);
+            RuntimePlanetBridge.rebindServerLevels(server, eligible);
             lastEligible = Set.copyOf(eligible);
-            reloadResources(server, eligible, notifyPlayers);
-            LOGGER.info("Northstar bridge discovered {} eligible dimensions; reloading server data", eligible.size());
-        } catch (IOException | RuntimeException exception) {
-            LOGGER.error("Failed to update generated Northstar dimension data", exception);
+            if (syncPlayers) {
+                BridgeNetworking.broadcastSnapshot(lastEligible);
+            }
+            LOGGER.info("Northstar bridge mapped {} eligible dimensions ({} runtime entries)", eligible.size(), installed);
+        } catch (RuntimeException exception) {
+            LOGGER.error("Failed to install runtime Northstar dimension mappings", exception);
         }
     }
 
@@ -214,100 +228,7 @@ public final class DimensionBridgeScanner {
         }
     }
 
-    private static void reloadResources(MinecraftServer minecraftServer, Set<ResourceLocation> expectedMappings, boolean notifyPlayers) {
-        var repository = minecraftServer.getPackRepository();
-        repository.reload();
-        String generatedPackId = repository.getAvailableIds().stream()
-                .filter(id -> id.equals(GENERATED_PACK)
-                        || id.equals("file/" + GENERATED_PACK)
-                        || id.endsWith("/" + GENERATED_PACK))
-                .findFirst()
-                .orElse(null);
-        if (generatedPackId == null) {
-            LOGGER.warn("Generated data pack {} was not discovered by the server", GENERATED_PACK);
-            return;
-        }
-
-        List<String> selected = new ArrayList<>(repository.getSelectedIds());
-        if (!selected.contains(generatedPackId)) {
-            selected.add(generatedPackId);
-        }
-        reloadPending = true;
-        try {
-            CompletableFuture<Void> reload = minecraftServer.reloadResources(selected);
-            reload.whenComplete((ignored, exception) -> minecraftServer.execute(() -> {
-                reloadPending = false;
-                if (exception != null) {
-                    LOGGER.error("Northstar data reload failed", exception);
-                    return;
-                }
-
-                pendingVerification = Set.copyOf(expectedMappings);
-                notifyWhenReady = notifyPlayers;
-                verificationDelayTicks = 1;
-                if (!retryInProgress) {
-                    verificationAttempts = 0;
-                }
-            }));
-        } catch (RuntimeException exception) {
-            reloadPending = false;
-            throw exception;
-        }
-    }
-
-    private static void verifyMappings() {
-        // Northstar normally performs this during TagsUpdatedEvent. Rebinding here makes
-        // the server-side Level cache deterministic even when a dynamic level was created
-        // while the data reload was being scheduled.
-        for (ServerLevel level : server.getAllLevels()) {
-            if (pendingVerification.contains(level.dimension().location())) {
-                ((NorthstarLevel) level).northstar$onResourceReload();
-            }
-        }
-
-        Set<ResourceLocation> missing = new HashSet<>();
-        for (ResourceLocation dimension : pendingVerification) {
-            ServerLevel level = null;
-            for (ServerLevel candidate : server.getAllLevels()) {
-                if (candidate.dimension().location().equals(dimension)) {
-                    level = candidate;
-                    break;
-                }
-            }
-            boolean trackerMissing = NorthstarLevel.SERVER_TRACKER.getPlanetByLevel(dimension) == null;
-            boolean levelCacheMissing = level != null && ((NorthstarLevel) level).northstar$planet() == null;
-            if (trackerMissing || levelCacheMissing) {
-                missing.add(dimension);
-            }
-        }
-
-        if (missing.isEmpty()) {
-            LOGGER.info("Northstar bridge verified {} Northstar dimension mappings", pendingVerification.size());
-            if (notifyWhenReady && !pendingVerification.isEmpty()) {
-                Component message = Component.literal("Northstar Bridge: dynamic dimensions are ready for telescopes.");
-                server.getPlayerList().getPlayers().forEach(player -> player.displayClientMessage(message, false));
-            }
-            pendingVerification = Set.of();
-            notifyWhenReady = false;
-            retryInProgress = false;
-            verificationAttempts = 0;
-            return;
-        }
-
-        LOGGER.warn("Northstar bridge could not verify mappings for: {}", missing);
-        pendingVerification = Set.of();
-        if (verificationAttempts++ == 0) {
-            retryInProgress = true;
-            forceReloadRequested = true;
-            LOGGER.info("Northstar bridge will retry the data reload once");
-        } else {
-            notifyWhenReady = false;
-            retryInProgress = false;
-            LOGGER.error("Northstar bridge retry did not register all expected dimensions");
-        }
-    }
-
-    private static String generatedName(ResourceLocation dimension) {
+    static String generatedName(ResourceLocation dimension) {
         String hash = sha256(dimension.toString()).substring(0, 16);
         return "dimension_" + hash;
     }
