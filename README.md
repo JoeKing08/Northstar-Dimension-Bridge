@@ -16,8 +16,10 @@ control Multiverse or Infinite Dimensions generation.
   already owns the overworld and its own dimensions.
 
 The generated data pack is stored under the active world's `datapacks` folder
-and is named `northstarbridge_generated`. New dimensions trigger a debounced
-server data reload so the client receives the updated Northstar registry.
+and is named `northstarbridge_generated`. New dimensions trigger an immediate,
+debounced server data reload so the client receives the updated Northstar
+registry. The bridge verifies the server mapping after each reload and notifies
+players when a newly discovered dynamic dimension is ready for telescopes.
 
 Configuration is generated at `config/northstarbridge-common.toml`.
 
