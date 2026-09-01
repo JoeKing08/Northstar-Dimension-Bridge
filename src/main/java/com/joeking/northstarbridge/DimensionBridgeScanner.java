@@ -256,9 +256,27 @@ public final class DimensionBridgeScanner {
     }
 
     private static void verifyMappings() {
+        // Northstar normally performs this during TagsUpdatedEvent. Rebinding here makes
+        // the server-side Level cache deterministic even when a dynamic level was created
+        // while the data reload was being scheduled.
+        for (ServerLevel level : server.getAllLevels()) {
+            if (pendingVerification.contains(level.dimension().location())) {
+                ((NorthstarLevel) level).northstar$onResourceReload();
+            }
+        }
+
         Set<ResourceLocation> missing = new HashSet<>();
         for (ResourceLocation dimension : pendingVerification) {
-            if (NorthstarLevel.SERVER_TRACKER.getPlanetByLevel(dimension) == null) {
+            ServerLevel level = null;
+            for (ServerLevel candidate : server.getAllLevels()) {
+                if (candidate.dimension().location().equals(dimension)) {
+                    level = candidate;
+                    break;
+                }
+            }
+            boolean trackerMissing = NorthstarLevel.SERVER_TRACKER.getPlanetByLevel(dimension) == null;
+            boolean levelCacheMissing = level != null && ((NorthstarLevel) level).northstar$planet() == null;
+            if (trackerMissing || levelCacheMissing) {
                 missing.add(dimension);
             }
         }
